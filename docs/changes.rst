@@ -2,6 +2,15 @@
 Changelog
 =========
 
+Unreleased
+----------
+
+* Add an optional ``ResourcePolicy`` for controlling which URIs an imported schema may claim.
+  When a policy is configured, the root resource, any self-declared ``$id`` and relative identifiers once resolved are checked against the caller-provided allowed URI ranges, both at registration time and while ``Registry.crawl`` discovers aliases.
+  Re-registering a URI with different contents raises a new ``exceptions.ConflictingResource`` instead of silently overwriting it (independent of traversal order), while identical contents remain idempotent; out-of-range URIs raise a new ``exceptions.URIOutsideScope``.
+  Error messages name the conflicting identifier and import source but never include resource contents, and a policy never triggers network retrieval.
+  Registries constructed without a policy keep their previous lenient behavior.
+
 v0.36.2
 -------
 

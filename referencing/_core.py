@@ -3,7 +3,7 @@ from __future__ import annotations
 from collections.abc import Iterable, Iterator, Sequence
 from enum import Enum
 from typing import Any, Callable, ClassVar, Generic, Protocol
-from urllib.parse import unquote, urldefrag, urljoin
+from urllib.parse import unquote, urldefrag, urljoin, urlparse
 
 from attrs import evolve, field
 from rpds import HashTrieMap, HashTrieSet, List
@@ -294,6 +294,99 @@ def _fail_to_retrieve(uri: URI):
     raise exceptions.NoSuchResource(ref=uri)
 
 
+class OnConflict(Enum):
+    """
+    How to react when a URI is registered with differing contents.
+
+    ``REJECT`` (the default for policy-based imports) raises a
+    `exceptions.ConflictingResource` error, so that traversal order can never
+    silently decide which resource wins.
+
+    ``REPLACE`` keeps the lenient, backwards-compatible behavior of
+    overwriting the previously registered resource.
+    """
+
+    REJECT = 1
+    REPLACE = 2
+
+
+@frozen
+class ResourcePolicy:
+    r"""
+    An ownership policy controlling which URIs an import may claim.
+
+    A policy is optional and, when present, is checked both while resources
+    are registered directly and while `Registry.crawl` discovers additional
+    aliases (subresource ``$id``\ s, including ones which resolve relative to
+    their parent).
+
+    ``allowed`` is the set of URI ranges the caller authorizes for a single
+    import declaration. A URI is in range when it equals one of the entries
+    or starts with one of them (so entries ending in ``/`` act as namespace
+    prefixes). The root resource, every self-declared ``$id`` and every
+    relative identifier once resolved must fall within the range.
+
+    A policy never performs any network access; it only inspects URIs and
+    locally registered resources.
+    """
+
+    _allowed: tuple[URI, ...] = field(
+        factory=tuple,
+        converter=tuple,
+        alias="allowed",
+    )
+    on_conflict: OnConflict = OnConflict.REJECT
+
+    def allows(self, uri: URI) -> bool:
+        """
+        Return whether the given URI falls within an allowed range.
+        """
+        return any(
+            uri == prefix or uri.startswith(prefix)
+            for prefix in self._allowed
+        )
+
+    def check_scope(
+        self,
+        uri: URI,
+        source: URI | None,
+    ) -> None:
+        """
+        Raise `exceptions.URIOutsideScope` if the URI is not allowed.
+        """
+        if not self.allows(uri):
+            raise exceptions.URIOutsideScope(
+                uri=uri,
+                source=source,
+                allowed=self._allowed,
+            )
+
+    def check_conflict(
+        self,
+        uri: URI,
+        existing: Resource[D] | None,
+        resource: Resource[D],
+        source: URI | None,
+    ) -> bool:
+        """
+        Check a URI against any resource already registered for it.
+
+        Return ``True`` if the new resource should replace the existing one
+        and ``False`` otherwise (no existing resource, or identical contents
+        which are treated idempotently). Differing contents raise
+        `exceptions.ConflictingResource` when the policy rejects conflicts.
+        """
+        if existing is None or existing == resource:
+            return False
+        if self.on_conflict is OnConflict.REPLACE:
+            return True
+        raise exceptions.ConflictingResource(
+            uri=uri,
+            source=source,
+            allowed=self._allowed,
+        )
+
+
 @frozen
 class Registry(Mapping[URI, Resource[D]]):
     r"""
@@ -327,6 +420,7 @@ class Registry(Mapping[URI, Resource[D]]):
     _anchors: HashTrieMap[tuple[URI, str], AnchorType[D]] = HashTrieMap()
     _uncrawled: HashTrieSet[URI] = EMPTY_UNCRAWLED
     _retrieve: Retrieve[D] = field(default=_fail_to_retrieve, alias="retrieve")
+    _policy: ResourcePolicy | None = field(default=None, alias="policy")
 
     def __getitem__(self, uri: URI) -> Resource[D]:
         """
@@ -386,10 +480,19 @@ class Registry(Mapping[URI, Resource[D]]):
 
         resources = self._resources
         uncrawled = self._uncrawled
+        policy = self._policy
         for resource in new:
             id = resource.id()
             if id is None:
                 raise exceptions.NoInternalID(resource=resource)
+            if policy is not None:
+                policy.check_scope(uri=id, source=id)
+                policy.check_conflict(
+                    uri=id,
+                    existing=resources.get(id),
+                    resource=resource,
+                    source=id,
+                )
             uncrawled = uncrawled.insert(id)
             resources = resources.insert(id, resource)
         return evolve(self, resources=resources, uncrawled=uncrawled)
@@ -423,6 +526,9 @@ class Registry(Mapping[URI, Resource[D]]):
         resource = registry._resources.get(uri)
         if resource is not None:
             return Retrieved(registry=registry, value=resource)
+
+        if registry._policy is not None:
+            registry._policy.check_scope(uri=uri, source=uri)
 
         try:
             resource = registry._retrieve(uri)
@@ -493,17 +599,45 @@ class Registry(Mapping[URI, Resource[D]]):
         """
         resources = self._resources
         anchors = self._anchors
-        uncrawled = [(uri, resources[uri]) for uri in self._uncrawled]
+        policy = self._policy
+        uncrawled = [
+            (uri, resources[uri], uri) for uri in self._uncrawled
+        ]
         while uncrawled:
-            uri, resource = uncrawled.pop()
+            uri, resource, source = uncrawled.pop()
 
             id = resource.id()
             if id is not None:
                 uri = urljoin(uri, id)
+                if policy is not None:
+                    policy.check_scope(uri=uri, source=source)
+                    policy.check_conflict(
+                        uri=uri,
+                        existing=resources.get(uri),
+                        resource=resource,
+                        source=source,
+                    )
                 resources = resources.insert(uri, resource)
+            elif policy is not None:
+                policy.check_conflict(
+                    uri=uri,
+                    existing=resources.get(uri),
+                    resource=resource,
+                    source=source,
+                )
             for each in resource.anchors():
                 anchors = anchors.insert((uri, each.name), each)
-            uncrawled.extend((uri, each) for each in resource.subresources())
+            for each in resource.subresources():
+                child_id = each.id()
+                if (
+                    policy is not None
+                    and child_id is not None
+                    and urlparse(child_id).scheme
+                ):
+                    # Absolute identifiers are checked immediately; relative
+                    # ones are checked only after they have been resolved.
+                    policy.check_scope(uri=child_id, source=source)
+                uncrawled.append((uri, each, source))
         return evolve(
             self,
             resources=resources,
@@ -526,10 +660,19 @@ class Registry(Mapping[URI, Resource[D]]):
         """
         resources = self._resources
         uncrawled = self._uncrawled
+        policy = self._policy
         for uri, resource in pairs:
             # Empty fragment URIs are equivalent to URIs without the fragment.
             # TODO: Is this true for non JSON Schema resources? Probably not.
             uri = uri.rstrip("#")
+            if policy is not None:
+                policy.check_scope(uri=uri, source=uri)
+                policy.check_conflict(
+                    uri=uri,
+                    existing=resources.get(uri),
+                    resource=resource,
+                    source=uri,
+                )
             uncrawled = uncrawled.insert(uri)
             resources = resources.insert(uri, resource)
         return evolve(self, resources=resources, uncrawled=uncrawled)
@@ -557,7 +700,17 @@ class Registry(Mapping[URI, Resource[D]]):
         anchors = self._anchors
         uncrawled = self._uncrawled
         retrieve = self._retrieve
+        policy = self._policy
         for registry in registries:
+            if policy is not None:
+                for uri, resource in registry._resources.items():
+                    policy.check_scope(uri=uri, source=uri)
+                    policy.check_conflict(
+                        uri=uri,
+                        existing=resources.get(uri),
+                        resource=resource,
+                        source=uri,
+                    )
             resources = resources.update(registry._resources)
             anchors = anchors.update(registry._anchors)
             uncrawled = uncrawled.update(registry._uncrawled)

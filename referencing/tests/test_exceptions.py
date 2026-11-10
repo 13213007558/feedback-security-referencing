@@ -21,6 +21,15 @@ thunks = (
     lambda: exceptions.PointerToNowhere(resource=TRUE, ref="urn:example:foo"),
     lambda: exceptions.Unresolvable("urn:example:foo"),
     lambda: exceptions.Unretrievable("urn:example:foo"),
+    lambda: exceptions.URIOutsideScope(
+        uri="urn:example:bar",
+        source="urn:example:foo",
+        allowed=("urn:example:",),
+    ),
+    lambda: exceptions.ConflictingResource(
+        uri="urn:example:bar",
+        source="urn:example:foo",
+    ),
 )
 
 

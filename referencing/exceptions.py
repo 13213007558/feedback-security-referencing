@@ -74,6 +74,65 @@ class Unretrievable(KeyError):
         return hash(attrs.astuple(self))
 
 
+@attrs.frozen  # Because here we allow subclassing below.
+class PolicyViolation(Exception):
+    """
+    A registry resource policy was violated while importing resources.
+
+    The message deliberately references only URIs (identifiers and the
+    import source), never the resource contents, which may contain sensitive
+    configuration.
+    """
+
+    uri: URI
+    source: URI | None = None
+    allowed: tuple[URI, ...] = ()
+
+    def __eq__(self, other: object) -> bool:
+        if self.__class__ is not other.__class__:
+            return NotImplemented
+        return attrs.astuple(self) == attrs.astuple(other)
+
+    def __hash__(self) -> int:
+        return hash(attrs.astuple(self))
+
+    def __str__(self) -> str:
+        source = self.source or "<unknown>"
+        allowed = ", ".join(repr(each) for each in self.allowed) or "<none>"
+        return (
+            f"URI {self.uri!r} (from import source {source!r}) is outside "
+            f"the allowed URI ranges: {allowed}"
+        )
+
+
+@frozen
+class URIOutsideScope(PolicyViolation):
+    """
+    An imported resource's URI is not within the allowed scope.
+
+    This applies to the root resource, any self-declared ``$id`` and to
+    subresources after their relative identifiers have been resolved.
+    """
+
+
+@frozen
+class ConflictingResource(PolicyViolation):
+    """
+    A URI is already registered with different resource contents.
+
+    The conflict is always rejected rather than silently overwriting the
+    existing resource, regardless of traversal order.
+    """
+
+    def __str__(self) -> str:
+        source = self.source or "<unknown>"
+        return (
+            f"conflicting resources for URI {self.uri!r} while importing "
+            f"from source {source!r}; the URI is already registered with "
+            "different contents"
+        )
+
+
 @frozen
 class CannotDetermineSpecification(Exception):
     """
