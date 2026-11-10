@@ -11,7 +11,7 @@ import attrs
 from referencing._attrs import frozen
 
 if TYPE_CHECKING:
-    from referencing import Resource
+    from referencing import Resource, Specification
     from referencing.typing import URI
 
 
@@ -163,3 +163,46 @@ class InvalidAnchor(Unresolvable):
             f"to use '#/{self.anchor}', as the slash is required *before each "
             "segment* of a JSON pointer."
         )
+
+
+@frozen
+class UnknownDialect(Exception):
+    """
+    A dialect identifier was found which no known specification recognizes.
+
+    The given URI was declared by a resource (e.g. via the JSON Schema
+    :kw:`$schema` keyword), but no `Specification` is registered for it.
+    It is therefore not safe to guess how the resource should be interpreted.
+    """
+
+    uri: URI
+
+    def __eq__(self, other: object) -> bool:
+        if self.__class__ is not other.__class__:
+            return NotImplemented
+        return attrs.astuple(self) == attrs.astuple(other)
+
+    def __hash__(self) -> int:
+        return hash(attrs.astuple(self))
+
+
+@frozen
+class DisallowedDialect(Exception):
+    """
+    A resource declared a dialect which is known, but not admitted by policy.
+
+    The given URI maps to a known `Specification`, but that specification is
+    not part of the `SpecificationAdmission` in effect, so the resource is
+    refused rather than being interpreted under a different dialect.
+    """
+
+    uri: URI
+    specification: Specification[Any]
+
+    def __eq__(self, other: object) -> bool:
+        if self.__class__ is not other.__class__:
+            return NotImplemented
+        return attrs.astuple(self) == attrs.astuple(other)
+
+    def __hash__(self) -> int:
+        return hash(attrs.astuple(self))

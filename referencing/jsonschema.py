@@ -15,6 +15,7 @@ from referencing._core import (
     Resolver as _Resolver,
     _Unset,  # type: ignore[reportPrivateUsage]
 )
+from referencing.exceptions import UnknownDialect
 from referencing.typing import URI, Anchor as AnchorType, Mapping
 
 #: A JSON Schema which is a JSON object
@@ -31,17 +32,6 @@ SchemaRegistry = Registry[Schema]
 
 #: The empty JSON Schema Registry
 EMPTY_REGISTRY: SchemaRegistry = Registry()
-
-
-@frozen
-class UnknownDialect(Exception):
-    """
-    A dialect identifier was found for a dialect unknown by this library.
-
-    If it's a custom ("unofficial") dialect, be sure you've registered it.
-    """
-
-    uri: URI
 
 
 def _dollar_id(contents: Schema) -> URI | None:

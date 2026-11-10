@@ -267,3 +267,82 @@ The above example would be written:
     print(resolver.lookup("https://json-schema.org/draft/2020-12/schema"))
 
 It is otherwise functionally equivalent to the above, other than that retrieval will not repeatedly make a web request.
+
+
+Restricting Admitted Specifications
+-----------------------------------
+
+By default, `referencing` trusts any dialect a resource declares via its :kw:`$schema` keyword, interpreting each root or embedded resource under the specification it identifies with.
+In settings where only a small set of dialects has been reviewed and approved, this means a referenced subresource could otherwise switch interpretation to an unreviewed dialect merely by declaring a different :kw:`$schema`.
+
+A `referencing.SpecificationAdmission` describes an admission policy: the set of specifications resources are *allowed* to identify as, along with an explicit ``default`` specification for resources which don't declare a dialect at all.
+Passing one to a `referencing.Registry` threads the policy through every resolver produced from the registry, so it applies both to root resources and to resources discovered while crawling embedded ones:
+
+.. testcode::
+
+    from referencing import Registry, SpecificationAdmission, exceptions
+    from referencing.jsonschema import DRAFT202012, DRAFT7
+
+    admission = SpecificationAdmission.admitting(
+        [DRAFT202012, DRAFT7],
+        default=DRAFT202012,
+    )
+    registry = Registry(admission=admission)
+
+A resource which declares an admitted dialect is interpreted under it, and one which declares nothing uses the policy's ``default``:
+
+.. testcode::
+
+    modern = registry.with_contents(
+        [
+            ("urn:modern", {
+                "$schema": "https://json-schema.org/draft/2020-12/schema",
+            }),
+            ("urn:plain", {"type": "integer"}),
+        ],
+    )
+    print(modern["urn:modern"] == DRAFT202012.create_resource(
+        {"$schema": "https://json-schema.org/draft/2020-12/schema"},
+    ))
+    print(modern["urn:plain"] == DRAFT202012.create_resource(
+        {"type": "integer"},
+    ))
+
+.. testoutput::
+
+    True
+    True
+
+Two distinct error conditions are reported separately, rather than silently reinterpreting the resource under some other dialect.
+A dialect URI the library doesn't recognize at all raises `referencing.exceptions.UnknownDialect`, whereas a *known* dialect that simply isn't admitted raises `referencing.exceptions.DisallowedDialect`:
+
+.. testcode::
+
+    try:
+        registry.with_contents(
+            [("urn:unknown", {"$schema": "https://example.com/custom"})],
+        )
+    except exceptions.UnknownDialect as error:
+        print("unknown:", error.uri)
+
+    try:
+        registry.with_contents(
+            [(
+                "urn:old",
+                {"$schema": "http://json-schema.org/draft-04/schema"},
+            )],
+        )
+    except exceptions.DisallowedDialect as error:
+        print("disallowed:", error.uri, "->", error.specification.name)
+
+.. testoutput::
+
+    unknown: https://example.com/custom
+    disallowed: http://json-schema.org/draft-04/schema -> draft-04
+
+The same checks apply to embedded resources when a registry is crawled, so a subresource nested inside an approved document cannot opt itself into a dialect the policy doesn't admit.
+A :kw:`$schema` string appearing merely as ordinary data (e.g. inside a ``const`` keyword) is not a resource declaration and therefore never triggers a dialect switch.
+
+Policies are per-registry and never mutate the process-wide set of known specifications, so two registries with different policies can coexist in the same process without interfering.
+Registries created without an admission policy retain the original behavior, where an unrecognized dialect falls back to the caller-provided default specification instead of raising.
+

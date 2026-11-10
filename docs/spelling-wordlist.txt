@@ -1,7 +1,10 @@
+admission
+admitted
 amongst
 autodetecting
 boolean
 changelog
+coexist
 deduplication
 dereferenced
 deserialized
@@ -17,12 +20,16 @@ instantiation
 iterable
 lookups
 metaschemas
+non-admitted
 referenceable
 resolvers
+reviewed
 runtime
 schemas
 subclassing
 submodules
 subresource
 subresources
+threaded
 unresolvable
+unrecognized

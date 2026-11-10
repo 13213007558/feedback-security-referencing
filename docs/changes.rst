@@ -2,6 +2,13 @@
 Changelog
 =========
 
+Next
+----
+
+* Add `referencing.SpecificationAdmission`, an optional admission policy which can be passed to a `referencing.Registry` to restrict the specifications root and embedded resources may identify as via their :kw:`$schema` keyword.
+  An unrecognized dialect URI raises `referencing.exceptions.UnknownDialect`, while a known but non-admitted dialect raises the new `referencing.exceptions.DisallowedDialect`; resources without a declared dialect use the policy's explicit default specification.
+  Registries without an admission policy are unchanged.
+
 v0.36.2
 -------
 

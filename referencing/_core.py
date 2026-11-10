@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Iterable, Iterator, Sequence
 from enum import Enum
-from typing import Any, Callable, ClassVar, Generic, Protocol
+from typing import Any, Callable, ClassVar, Generic, Protocol, Union
 from urllib.parse import unquote, urldefrag, urljoin
 
 from attrs import evolve, field
@@ -85,6 +85,124 @@ class _SpecificationDetector:
             return _detect_or_error
         else:
             return _detect_or_default(instance)
+
+
+#: Either a concrete `Specification` (used directly as the default) or a
+#: `SpecificationAdmission` policy describing both the default and the set of
+#: admitted specifications.
+DefaultSpecificationOrAdmission = Union[
+    "Specification[D]",
+    "SpecificationAdmission[D]",
+    type["Specification[D]"],
+]
+
+
+@frozen
+class SpecificationAdmission(Generic[D]):
+    """
+    An admission policy controlling which specifications resources may use.
+
+    Policies constrain the dialects that referenced (root or embedded)
+    resources are allowed to identify as, so that a subresource declaring its
+    own :kw:`$schema` cannot silently switch interpretation to a dialect that
+    was not approved.
+
+    A resource which explicitly declares a dialect is checked against the
+    policy:
+
+        * a dialect URI unknown to the library raises
+          `referencing.exceptions.UnknownDialect` (rather than being treated
+          as the latest draft or any other dialect),
+
+        * a known dialect which is not part of the admitted specifications
+          raises `referencing.exceptions.DisallowedDialect`.
+
+    A resource which does not declare a dialect is interpreted using the
+    policy's explicit ``default`` specification.
+
+    An admission is a callable-like object exposing the same ``detect``
+    interface as a `Specification`, which allows it to be threaded through
+    `Resource.from_contents`, `Registry` and `Resolver` alongside the
+    resources it governs.
+    """
+
+    #: The specifications resources are allowed to identify as.
+    allowed: frozenset[Specification[D]] = field(  # type: ignore[reportGeneralTypeIssues]
+        converter=frozenset,
+    )
+
+    #: The specification used for resources which do not declare one.
+    default: Specification[D]
+
+    def __attrs_post_init__(self) -> None:
+        if self.default not in self.allowed:
+            raise ValueError(  # noqa: TRY003
+                "The default specification must itself be an admitted "
+                f"specification, but {self.default!r} is not among "
+                f"{sorted(self.allowed, key=lambda each: each.name)!r}.",
+            )
+
+    @classmethod
+    def admitting(
+        cls,
+        specifications: Iterable[Specification[D]],
+        default: Specification[D] | None = None,
+    ) -> SpecificationAdmission[D]:
+        """
+        Create an admission allowing the given specifications.
+
+        If no explicit ``default`` is given, one of the admitted
+        specifications is used as the default for resources without a
+        declared dialect. Pass ``default`` explicitly to choose which.
+        """
+        allowed = frozenset(specifications)
+        if not allowed:
+            raise ValueError(  # noqa: TRY003
+                "An admission policy must admit at least one specification.",
+            )
+        if default is None:
+            default = next(iter(allowed))
+        return cls(allowed=allowed, default=default)
+
+    def detect(self, contents: D) -> Specification[D]:
+        """
+        Detect the specification of the given contents under this policy.
+
+        Raises:
+
+            `referencing.exceptions.CannotDetermineSpecification`
+
+                if the contents declare a non-string dialect identifier
+
+            `referencing.exceptions.UnknownDialect`
+
+                if the contents declare a dialect no specification recognizes
+
+            `referencing.exceptions.DisallowedDialect`
+
+                if the contents declare a known but non-admitted dialect
+
+        """
+        if not isinstance(contents, Mapping):
+            return self.default
+
+        jsonschema_dialect_id = contents.get(  # type: ignore[reportUnknownMemberType]
+            "$schema",
+        )
+        if jsonschema_dialect_id is None:
+            return self.default
+        if not isinstance(jsonschema_dialect_id, str):
+            raise exceptions.CannotDetermineSpecification(contents)
+
+        from referencing.jsonschema import specification_with
+
+        specification = specification_with(jsonschema_dialect_id)
+        if specification not in self.allowed:
+            raise exceptions.DisallowedDialect(
+                uri=jsonschema_dialect_id,
+                specification=specification,
+            )
+        return specification
 
 
 @frozen
@@ -197,11 +315,17 @@ class Resource(Generic[D]):
         cls,
         contents: D,
         default_specification: (
-            type[Specification[D]] | Specification[D]
+            DefaultSpecificationOrAdmission[D]
         ) = Specification,
     ) -> Resource[D]:
         """
         Create a resource guessing which specification applies to the contents.
+
+        ``default_specification`` may be a `Specification` (or the
+        `Specification` class itself) or else a `SpecificationAdmission`
+        policy. When given an admission, the policy both provides the default
+        specification for contents which don't declare a dialect and checks
+        any explicitly declared dialect against the admitted specifications.
 
         Raises:
 
@@ -210,6 +334,16 @@ class Resource(Generic[D]):
                 if the given contents don't have any discernible
                 information which could be used to guess which
                 specification they identify as
+
+            `referencing.exceptions.UnknownDialect`
+
+                if an admission policy is in effect and the contents declare
+                a dialect which no known specification recognizes
+
+            `referencing.exceptions.DisallowedDialect`
+
+                if an admission policy is in effect and the contents declare
+                a known, but non-admitted, dialect
 
         """
         specification = default_specification.detect(contents)
@@ -233,14 +367,26 @@ class Resource(Generic[D]):
             return
         return id.rstrip("#")
 
-    def subresources(self) -> Iterable[Resource[D]]:
+    def subresources(
+        self,
+        default_specification: (
+            DefaultSpecificationOrAdmission[D] | _Unset
+        ) = _UNSET,
+    ) -> Iterable[Resource[D]]:
         """
         Retrieve this resource's subresources.
+
+        By default each subresource is detected using this resource's own
+        specification as the default (in case a subresource doesn't declare
+        one). If given a `SpecificationAdmission`, the policy is used to
+        detect every subresource instead, checking any dialect they declare.
         """
+        if default_specification is _UNSET:
+            default_specification = self._specification
         return (
             Resource.from_contents(
                 each,
-                default_specification=self._specification,
+                default_specification=default_specification,
             )
             for each in self._specification.subresources_of(self.contents)
         )
@@ -327,6 +473,17 @@ class Registry(Mapping[URI, Resource[D]]):
     _anchors: HashTrieMap[tuple[URI, str], AnchorType[D]] = HashTrieMap()
     _uncrawled: HashTrieSet[URI] = EMPTY_UNCRAWLED
     _retrieve: Retrieve[D] = field(default=_fail_to_retrieve, alias="retrieve")
+    _admission: SpecificationAdmission[D] | None = field(
+        default=None,
+        alias="admission",
+    )
+
+    @property
+    def admission(self) -> SpecificationAdmission[D] | None:
+        """
+        The `SpecificationAdmission` policy governing this registry, if any.
+        """
+        return self._admission
 
     def __getitem__(self, uri: URI) -> Resource[D]:
         """
@@ -428,7 +585,9 @@ class Registry(Mapping[URI, Resource[D]]):
             resource = registry._retrieve(uri)
         except (
             exceptions.CannotDetermineSpecification,
+            exceptions.DisallowedDialect,
             exceptions.NoSuchResource,
+            exceptions.UnknownDialect,
         ):
             raise
         except Exception as error:
@@ -503,7 +662,11 @@ class Registry(Mapping[URI, Resource[D]]):
                 resources = resources.insert(uri, resource)
             for each in resource.anchors():
                 anchors = anchors.insert((uri, each.name), each)
-            uncrawled.extend((uri, each) for each in resource.subresources())
+            if self._admission is None:
+                subresources = resource.subresources()
+            else:
+                subresources = resource.subresources(self._admission)
+            uncrawled.extend((uri, each) for each in subresources)
         return evolve(
             self,
             resources=resources,
@@ -537,13 +700,24 @@ class Registry(Mapping[URI, Resource[D]]):
     def with_contents(
         self,
         pairs: Iterable[tuple[URI, D]],
-        **kwargs: Any,
+        default_specification: (
+            DefaultSpecificationOrAdmission[D] | _Unset
+        ) = _UNSET,
     ) -> Registry[D]:
         r"""
         Add the given contents to the registry, autodetecting when necessary.
+
+        If no ``default_specification`` is given and the registry has a
+        `SpecificationAdmission` policy, the policy is used to detect (and
+        check) each document's specification.
         """
+        if default_specification is _UNSET:
+            if self._admission is not None:
+                default_specification = self._admission
+            else:
+                default_specification = Specification
         return self.with_resources(
-            (uri, Resource.from_contents(each, **kwargs))
+            (uri, Resource.from_contents(each, default_specification))
             for uri, each in pairs
         )
 
@@ -557,6 +731,7 @@ class Registry(Mapping[URI, Resource[D]]):
         anchors = self._anchors
         uncrawled = self._uncrawled
         retrieve = self._retrieve
+        admission = self._admission
         for registry in registries:
             resources = resources.update(registry._resources)
             anchors = anchors.update(registry._anchors)
@@ -569,12 +744,24 @@ class Registry(Mapping[URI, Resource[D]]):
                         "functions.",
                     )
                 retrieve = registry._retrieve
+
+            if registry._admission is not None:
+                if (
+                    admission is not None
+                    and registry._admission != admission
+                ):
+                    raise ValueError(  # noqa: TRY003
+                        "Cannot combine registries with conflicting "
+                        "specification admission policies.",
+                    )
+                admission = registry._admission
         return evolve(
             self,
             anchors=anchors,
             resources=resources,
             uncrawled=uncrawled,
             retrieve=retrieve,
+            admission=admission,
         )
 
     def resolver(self, base_uri: URI = "") -> Resolver[D]:
@@ -649,6 +836,16 @@ class Resolver(Generic[D]):
     _base_uri: URI = field(alias="base_uri")
     _registry: Registry[D] = field(alias="registry")
     _previous: List[URI] = field(default=List(), repr=False, alias="previous")
+
+    @property
+    def admission(self) -> SpecificationAdmission[D] | None:
+        """
+        The `SpecificationAdmission` policy governing this resolver, if any.
+
+        The policy is carried by the underlying registry and therefore
+        follows the resolver across root and embedded resources.
+        """
+        return self._registry.admission
 
     def lookup(self, ref: URI) -> Resolved[D]:
         """
